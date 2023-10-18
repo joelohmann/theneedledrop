@@ -9,11 +9,12 @@ import os
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+import base64
 
 
 load_dotenv()
 
-auth_manager = SpotifyOAuth(scope='playlist-modify-public')
+auth_manager = SpotifyOAuth(scope='playlist-modify-public ugc-image-upload')
 sp = spotipy.Spotify(auth_manager=auth_manager)
 
 
@@ -43,7 +44,7 @@ def get_songs() -> dict:
 
     songs = dict()
     for video in all_videos:
-        video_title = str(video['snippet']['title'])
+        video_title = str(video['snippet']['title']).split("| ")[-1]
 
         if "Weekly Track Roundup" not in video_title:
             continue
@@ -68,16 +69,44 @@ def get_songs() -> dict:
     return songs
 
 
-def get_track_id(track: tuple) -> int:
+def get_track_uri(track: tuple[str, str]) -> int:
+    title_words = ['ft. ', 'feat. ']
+
+    import pdb
+    pdb.set_trace()
+
     artist, title = track
     search = sp.search(q='artist:' + artist + ' track:' + title, type='track', limit=3)
-    return search['tracks']['items'][0]['id']
+
+    results = search['tracks']['items']
+
+    if len(results) == 0:
+        for word in title_words:
+            if word in title:
+                title = title.replace(word, '')
+        
+        search = sp.search(q='artist:' + artist + ' track:' + title, type='track', limit=3)
+    return results[0]['uri']
+    # If no results stil, need to skip to next and log, or try to search again with different parameters
 
 
-def upload_songs(songs: dict):
+def upload_songs(songs: dict):   
+    user_id = sp.current_user()['id']
+    user_playlists = [playlist['name'] for playlist in sp.user_playlists(user_id)['items']]
+
+    with open("./assets/fantano.jpg", "rb") as img:
+        img_64_encode = base64.b64encode(img.read())
+
     for video, tracks in songs.items():
-        for track in tracks:
-            get_track_id(track)
+        # if video in user_playlists:
+        #     continue
+        
+        playlist = sp.user_playlist_create(user_id, video, description="Anthony Fantano's music highlights of the week.")
+
+        sp.playlist_upload_cover_image(playlist['id'], img_64_encode)
+
+        for track in tracks:            
+            track_uri = get_track_uri(track)
             return
     return
 
