@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import base64
+from difflib import SequenceMatcher
+
+from urllib.parse import quote
 
 
 load_dotenv()
@@ -17,8 +20,10 @@ load_dotenv()
 auth_manager = SpotifyOAuth(scope='playlist-modify-public ugc-image-upload')
 sp = spotipy.Spotify(auth_manager=auth_manager)
 
+user_id = sp.current_user()['id']
 
-def get_videos() -> dict:
+
+def get_videos() -> list[dict]:
     channel_params = {
         'key': os.environ['YOUTUBE_API_KEY'],
         'part': "contentDetails",
@@ -27,27 +32,77 @@ def get_videos() -> dict:
     channel_request = requests.get("https://www.googleapis.com/youtube/v3/channels", params=channel_params).json()
     channel_id = channel_request['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
+    user_playlists = [playlist['name'] for playlist in sp.user_playlists(user_id)['items']]
+
     playlist_params = {
         'key': os.environ['YOUTUBE_API_KEY'],
         'part': "snippet",
         'playlistId': channel_id,
         'maxResults': 50
     }
-    playlist_request = requests.get("https://www.googleapis.com/youtube/v3/playlistItems", params=playlist_params).json()
-    videos = playlist_request['items']
 
-    return videos
+    roundup_videos = list()
+    while len(roundup_videos) < 5:
+        try:
+            playlist_params['pageToken'] = playlist_request['nextPageToken']
+        except NameError:
+            pass
+
+        playlist_request = requests.get("https://www.googleapis.com/youtube/v3/playlistItems", params=playlist_params).json()
+
+        roundup_videos.extend([video for video in playlist_request['items'] if "Weekly Track Roundup" in str(video['snippet']['title']).split("| ")[-1]])
+        # TODO: Do this outside of loop? Just return all results from roundup_videos that match conditional
+
+    return [video for video in roundup_videos if str(video['snippet']['title']).split("| ")[-1] not in user_playlists]
 
 
-def get_songs() -> dict:
+count = 0
+def get_track_uri(artist: str, title: str, rerun: bool = False) -> str:
+    global count
+    if rerun:
+        problem_words = ["ft. ", "feat. ", "& ", "(", ")"]
+
+        for word in problem_words:
+            if word in title:
+                title = title.replace(word, "")
+            if word in artist:
+                artist = artist.replace(word, "")
+
+    # TODO: Use urllib to create actual query using quote(). Might actually work despite previous testing.
+    search = sp.search(q=f'artist:{artist} track:{title}', type='track', market="US", limit=3)
+    # search = sp.search(q=quote(f'artist:{artist} track:{title}'), type='track', market="US", limit=3)
+
+    results = search['tracks']['items']
+
+    # Good result
+    if len(results) > 0:
+        if SequenceMatcher(None, title.lower(), results[0]['name'].lower()).ratio() > 0.7 or results[0]['name'].lower().split()[0] == title.lower().split()[0]:
+            return results[0]['uri']
+        else:
+            print(f"track:{title}   result:{results[0]['name']}")
+        
+    if rerun:
+        # import pdb
+        # pdb.set_trace()
+        print(count, f"artist:{artist} track:{title}")
+        count += 1
+        return ""
+    
+    return get_track_uri(artist, title, rerun=True)
+    
+    
+
+
+def get_new_tracks() -> dict[str: list[tuple[str, str, str]]] | None:
     all_videos = get_videos()
+
+    if not all_videos:
+        return None
 
     songs = dict()
     for video in all_videos:
-        video_title = str(video['snippet']['title']).split("| ")[-1]
 
-        if "Weekly Track Roundup" not in video_title:
-            continue
+        video_title = str(video['snippet']['title']).split("| ")[-1]
 
         description = str(video['snippet']['description'])
         description = description.split("BEST TRACKS")[1].split("\n", 1)[1].split("===")[0]
@@ -64,53 +119,46 @@ def get_songs() -> dict:
 
             
             for title in track_title.split(" / "):
-                songs[video_title].append((track_artist, title))
+                track_uri = get_track_uri(track_artist, title)
+                if not track_uri:
+                    track_uri = f"NOT FOUND: {track_artist} - {title}"
+
+                # TODO Make this work
+                # if track_uri not in [song[2] for song in songs[video_title]]:
+                songs[video_title].append((track_artist, title, track_uri))
 
     return songs
 
 
-def get_track_uri(track: tuple[str, str]) -> int:
-    title_words = ['ft. ', 'feat. ']
-
-    import pdb
-    pdb.set_trace()
-
-    artist, title = track
-    search = sp.search(q='artist:' + artist + ' track:' + title, type='track', limit=3)
-
-    results = search['tracks']['items']
-
-    if len(results) == 0:
-        for word in title_words:
-            if word in title:
-                title = title.replace(word, '')
-        
-        search = sp.search(q='artist:' + artist + ' track:' + title, type='track', limit=3)
-    return results[0]['uri']
-    # If no results stil, need to skip to next and log, or try to search again with different parameters
-
-
-def upload_songs(songs: dict):   
-    user_id = sp.current_user()['id']
-    user_playlists = [playlist['name'] for playlist in sp.user_playlists(user_id)['items']]
-
+def create_playlists(songs: dict[str: list[tuple[str, str, str]]]) -> list[str]:
     with open("./assets/fantano.jpg", "rb") as img:
         img_64_encode = base64.b64encode(img.read())
 
+    uploaded_playlists = list()
     for video, tracks in songs.items():
-        # if video in user_playlists:
-        #     continue
-        
-        playlist = sp.user_playlist_create(user_id, video, description="Anthony Fantano's music highlights of the week.")
+        track_uris = list()
+        description = "Anthony Fantano's music highlights of the week."
+        for track in tracks:
+            if "NOT FOUND: " in track[2]:
+                if "COULD NOT ADD THE FOLLOWING: " not in description:
+                    description += f" COULD NOT ADD THE FOLLOWING: {track[2].split('NOT FOUND: ')[1]}"
+                else:
+                    description += f" || {track[2].split('NOT FOUND: ')[1]}"
+            else:
+                track_uris.append(track[2])
 
+        playlist = sp.user_playlist_create(user_id, video, description=description)
         sp.playlist_upload_cover_image(playlist['id'], img_64_encode)
 
-        for track in tracks:            
-            track_uri = get_track_uri(track)
-            return
-    return
+        sp.playlist_add_items(playlist['id'], track_uris)
+
+        uploaded_playlists.append(video)
+            
+    return uploaded_playlists
 
 
 if __name__ == "__main__":
-    songs = get_songs()
-    upload_songs(songs)
+    new_tracks = get_new_tracks()
+    
+    if new_tracks:
+        uploaded_playlists = create_playlists(new_tracks)
